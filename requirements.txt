@@ -1,0 +1,8 @@
+opencv-python>=4.9
+scikit-learn>=1.4
+numpy>=1.26
+Pillow>=10.3
+fastapi>=0.111
+uvicorn[standard]>=0.29
+sqlmodel>=0.0.19
+python-multipart>=0.0.9
