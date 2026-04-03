@@ -15,8 +15,15 @@ from models import Template, TemplateRead
 
 STORAGE_DIR = os.path.join(DATA_DIR, "storage", "templates")
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
+API_KEY = os.getenv("API_KEY", "dev-api-key")
 
-app = FastAPI(title="Paint by Numbers API")
+
+def require_api_key(x_api_key: Annotated[Optional[str], Header()] = None) -> None:
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+
+
+app = FastAPI(title="Paint by Numbers API", dependencies=[Depends(require_api_key)])
 
 
 @app.on_event("startup")
