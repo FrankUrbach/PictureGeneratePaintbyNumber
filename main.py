@@ -117,6 +117,22 @@ def get_palette(template_id: int, session: Session = Depends(get_session)) -> di
         return json.load(f)
 
 
+@app.delete("/admin/templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_template(
+    template_id: int,
+    _: None = Depends(require_admin),
+    session: Session = Depends(get_session),
+) -> None:
+    t = session.get(Template, template_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Template not found")
+    output_dir = os.path.dirname(t.outline_path)
+    if os.path.isdir(output_dir):
+        shutil.rmtree(output_dir)
+    session.delete(t)
+    session.commit()
+
+
 @app.post("/admin/upload", response_model=TemplateRead, status_code=status.HTTP_201_CREATED)
 async def upload_template(
     file: UploadFile,
