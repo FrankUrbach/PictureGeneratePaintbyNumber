@@ -97,6 +97,17 @@ def get_preview(template_id: int, session: Session = Depends(get_session)) -> Fi
     return FileResponse(t.preview_path, media_type="image/png")
 
 
+@app.get("/templates/{template_id}/regions")
+def get_regions(template_id: int, session: Session = Depends(get_session)) -> FileResponse:
+    t = session.get(Template, template_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Template not found")
+    regions_path = os.path.join(os.path.dirname(t.outline_path), "regions.png")
+    if not os.path.isfile(regions_path):
+        raise HTTPException(status_code=404, detail="Regions map not available")
+    return FileResponse(regions_path, media_type="image/png")
+
+
 @app.get("/templates/{template_id}/palette")
 def get_palette(template_id: int, session: Session = Depends(get_session)) -> dict:
     t = session.get(Template, template_id)

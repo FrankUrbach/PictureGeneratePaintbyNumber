@@ -162,6 +162,13 @@ def generate(input_path: str, n_colors: int, output_dir: str, blur: int = 4) -> 
     outline_img.save(os.path.join(output_dir, "outline.png"))
     print("Saved outline.png")
 
+    # --- regions.png (grayscale: pixel value = color number 1..N) ---
+    # Allows the iPhone app to determine the region and target color for any
+    # pixel by reading its grayscale value and looking it up in palette.json.
+    regions_arr = np.vectorize(color_numbers.get)(label_img).astype(np.uint8)
+    Image.fromarray(regions_arr).save(os.path.join(output_dir, "regions.png"))
+    print("Saved regions.png")
+
     # --- palette.json ---
     palette_data = {
         str(color_numbers[i]): "#{:02X}{:02X}{:02X}".format(*palette[i].tolist())
