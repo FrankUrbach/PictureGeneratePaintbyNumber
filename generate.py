@@ -11,6 +11,8 @@ from sklearn.cluster import KMeans
 
 MAX_WIDTH = 1000
 MIN_REGION_PIXELS = 200  # smaller regions get merged into nearest neighbor
+OUTPUT_SCALE = 2         # outline.png and preview.png are rendered at this multiplier
+REPEAT_AREA_THRESHOLD = 15000  # original pixels; larger regions get a grid of numbers
 
 
 def load_and_prepare(path: str, blur_radius: int = 0) -> np.ndarray:
@@ -72,49 +74,132 @@ def smooth_labels(label_img: np.ndarray, radius: int) -> np.ndarray:
     return cv2.medianBlur(label_img.astype(np.uint8), ksize).astype(np.int32)
 
 
-def build_outline(label_img: np.ndarray) -> np.ndarray:
-    """Return a binary mask (uint8, 255=border) of region boundaries."""
-    border = np.zeros(label_img.shape, dtype=np.uint8)
+def build_outline_aa(label_img: np.ndarray, scale: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Scale up label_img by `scale` (nearest-neighbor) and return:
+    - border_aa: float32 array [0..255], anti-aliased border mask at high resolution
+    - scaled_label: int32 scaled label image (same resolution as border_aa)
+    """
+    h, w = label_img.shape
+    sh, sw = h * scale, w * scale
+
+    # Scale label image: nearest-neighbor preserves exact label values
+    scaled = cv2.resize(label_img.astype(np.uint8), (sw, sh),
+                        interpolation=cv2.INTER_NEAREST).astype(np.int32)
+
+    # Detect 1px borders where adjacent labels differ
+    border = np.zeros((sh, sw), dtype=np.uint8)
     for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-        shifted = np.roll(label_img, (dy, dx), axis=(0, 1))
-        border |= (label_img != shifted).astype(np.uint8)
-    return border * 255
+        shifted = np.roll(scaled, (dy, dx), axis=(0, 1))
+        border |= (scaled != shifted).astype(np.uint8)
+
+    # Anti-alias: gentle Gaussian blur softens the hard pixel edges
+    border_float = border.astype(np.float32) * 255.0
+    border_aa = cv2.GaussianBlur(border_float, (3, 3), 0.8)
+
+    # Normalize so peak stays at 255
+    max_val = border_aa.max()
+    if max_val > 0:
+        border_aa = border_aa * (255.0 / max_val)
+
+    return border_aa, scaled
 
 
-def region_centroids(label_img: np.ndarray, n_colors: int) -> dict[int, list[tuple[int, int]]]:
-    """Return mapping color_idx -> list of (cx, cy) centroids for each connected component."""
-    centroids: dict[int, list[tuple[int, int]]] = {}
+def compute_number_placements(
+    label_img: np.ndarray, n_colors: int, scale: int
+) -> dict[int, list[tuple[int, int, float]]]:
+    """
+    Return color_idx -> [(sx, sy, max_r_scaled), ...] at scaled pixel coordinates.
+
+    Placement uses the distance transform: each number is placed at the point
+    that is furthest from any region border (deepest interior point). The
+    distance value (max_r) directly determines the maximum font size that fits.
+
+    Large regions (>= REPEAT_AREA_THRESHOLD) get a grid of placements; each
+    cell uses its own local distance-transform maximum so every number sits
+    in the most open spot within that cell.
+    """
+    MIN_RADIUS = 4  # original pixels; thinner regions get no number
+
+    placements: dict[int, list[tuple[int, int, float]]] = {}
     for color_idx in range(n_colors):
         mask = (label_img == color_idx).astype(np.uint8)
+        dist_full = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+
         num, components, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        pts = []
+        pts: list[tuple[int, int, float]] = []
         for comp_id in range(1, num):
             area = stats[comp_id, cv2.CC_STAT_AREA]
-            cx = stats[comp_id, cv2.CC_STAT_LEFT] + stats[comp_id, cv2.CC_STAT_WIDTH] // 2
-            cy = stats[comp_id, cv2.CC_STAT_TOP] + stats[comp_id, cv2.CC_STAT_HEIGHT] // 2
-            pts.append((cx, cy, area))
-        centroids[color_idx] = pts
-    return centroids
-
-
-def font_size_for_area(area: int) -> int:
-    if area < 500:
-        return 8
-    if area < 2000:
-        return 10
-    if area < 8000:
-        return 13
-    return 16
-
-
-def draw_numbers(outline_img: Image.Image, centroids: dict, color_numbers: dict[int, int]) -> Image.Image:
-    draw = ImageDraw.Draw(outline_img)
-    for color_idx, regions in centroids.items():
-        number = color_numbers[color_idx]
-        for cx, cy, area in regions:
             if area < MIN_REGION_PIXELS:
                 continue
-            size = font_size_for_area(area)
+
+            bx = stats[comp_id, cv2.CC_STAT_LEFT]
+            by = stats[comp_id, cv2.CC_STAT_TOP]
+            bw = stats[comp_id, cv2.CC_STAT_WIDTH]
+            bh = stats[comp_id, cv2.CC_STAT_HEIGHT]
+
+            # Distance transform restricted to this connected component
+            comp_mask = (components == comp_id).astype(np.uint8)
+            dist = dist_full * comp_mask
+
+            if area >= REPEAT_AREA_THRESHOLD:
+                # Split bounding box into a grid; find the best spot per cell.
+                grid_cols = max(2, bw // 150)
+                grid_rows = max(2, bh // 150)
+                step_x = bw // grid_cols
+                step_y = bh // grid_rows
+                placed = False
+                for row in range(grid_rows):
+                    for col in range(grid_cols):
+                        x0 = bx + col * step_x
+                        y0 = by + row * step_y
+                        x1 = min(x0 + step_x, bx + bw)
+                        y1 = min(y0 + step_y, by + bh)
+                        cell = dist[y0:y1, x0:x1]
+                        local_max = float(cell.max())
+                        if local_max < MIN_RADIUS:
+                            continue
+                        loc = np.unravel_index(cell.argmax(), cell.shape)
+                        lx, ly = x0 + loc[1], y0 + loc[0]
+                        pts.append((lx * scale, ly * scale, local_max * scale))
+                        placed = True
+                if not placed:
+                    # Entire component was too thin – try global max as fallback
+                    _, max_r, _, max_loc = cv2.minMaxLoc(dist)
+                    if max_r >= MIN_RADIUS:
+                        pts.append((max_loc[0] * scale, max_loc[1] * scale, float(max_r) * scale))
+            else:
+                # Single placement at the deepest interior point
+                _, max_r, _, max_loc = cv2.minMaxLoc(dist)
+                if max_r < MIN_RADIUS:
+                    continue  # region too thin for any legible number
+                pts.append((max_loc[0] * scale, max_loc[1] * scale, float(max_r) * scale))
+
+        placements[color_idx] = pts
+    return placements
+
+
+def font_size_for_radius(max_r_scaled: float, scale: int) -> int:
+    """
+    Derive font size from the inscribed-circle radius at scaled resolution.
+    The number height is set to ~80 % of the available diameter, clamped to
+    a sensible range so numbers are always legible but never overflow the region.
+    """
+    size = int(max_r_scaled * 2 * 0.75)
+    return max(7 * scale, min(18 * scale, size))
+
+
+def draw_numbers(
+    outline_img: Image.Image,
+    placements: dict[int, list[tuple[int, int, float]]],
+    color_numbers: dict[int, int],
+    scale: int,
+) -> Image.Image:
+    draw = ImageDraw.Draw(outline_img)
+    for color_idx, regions in placements.items():
+        number = color_numbers[color_idx]
+        for sx, sy, max_r_scaled in regions:
+            size = font_size_for_radius(max_r_scaled, scale)
             try:
                 font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", size)
             except Exception:
@@ -123,11 +208,11 @@ def draw_numbers(outline_img: Image.Image, centroids: dict, color_numbers: dict[
             bbox = draw.textbbox((0, 0), text, font=font)
             tw = bbox[2] - bbox[0]
             th = bbox[3] - bbox[1]
-            draw.text((cx - tw // 2, cy - th // 2), text, fill=0, font=font)
+            draw.text((sx - tw // 2, sy - th // 2), text, fill=0, font=font)
     return outline_img
 
 
-def generate(input_path: str, n_colors: int, output_dir: str, blur: int = 4) -> None:
+def generate(input_path: str, n_colors: int, output_dir: str, blur: int = 4, scale: int = OUTPUT_SCALE) -> None:
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"Loading image: {input_path}")
@@ -145,28 +230,37 @@ def generate(input_path: str, n_colors: int, output_dir: str, blur: int = 4) -> 
     # Assign a display number to each color (1-based)
     color_numbers = {i: i + 1 for i in range(palette.shape[0])}
 
-    # --- preview.png (colored result) ---
+    # --- preview.png (colored result, scaled up for crisp display) ---
     preview_rgb = palette[label_img]
+    h, w = label_img.shape
     preview = Image.fromarray(preview_rgb.astype(np.uint8))
+    preview = preview.resize((w * scale, h * scale), Image.LANCZOS)
     preview.save(os.path.join(output_dir, "preview.png"))
     print("Saved preview.png")
 
-    # --- outline.png (white + black borders + numbers) ---
-    border_mask = build_outline(label_img)
-    h, w = border_mask.shape
-    outline_arr = np.ones((h, w, 3), dtype=np.uint8) * 255
-    outline_arr[border_mask == 255] = [0, 0, 0]
-    outline_img = Image.fromarray(outline_arr)
-    centroids = region_centroids(label_img, palette.shape[0])
-    outline_img = draw_numbers(outline_img, centroids, color_numbers)
+    # --- outline.png (anti-aliased borders + numbers, high resolution) ---
+    print("Building anti-aliased outline…")
+    border_aa, _ = build_outline_aa(label_img, scale)
+    sh, sw = border_aa.shape
+
+    # Compose: white background blended with anti-aliased black border
+    alpha = border_aa / 255.0  # [0..1]; 1 = full black border
+    outline_arr = np.ones((sh, sw, 3), dtype=np.float32) * 255.0
+    for c in range(3):
+        outline_arr[:, :, c] *= (1.0 - alpha)
+    outline_img = Image.fromarray(np.clip(outline_arr, 0, 255).astype(np.uint8))
+
+    placements = compute_number_placements(label_img, palette.shape[0], scale)
+    outline_img = draw_numbers(outline_img, placements, color_numbers, scale)
     outline_img.save(os.path.join(output_dir, "outline.png"))
     print("Saved outline.png")
 
-    # --- regions.png (grayscale: pixel value = color number 1..N) ---
-    # Allows the iPhone app to determine the region and target color for any
-    # pixel by reading its grayscale value and looking it up in palette.json.
+    # --- regions.png (scaled up with nearest-neighbor to match outline/preview resolution) ---
+    # Nearest-neighbor preserves exact color-number values (no interpolation blending).
     regions_arr = np.vectorize(color_numbers.get)(label_img).astype(np.uint8)
-    Image.fromarray(regions_arr).save(os.path.join(output_dir, "regions.png"))
+    regions_img = Image.fromarray(regions_arr)
+    regions_img = regions_img.resize((w * scale, h * scale), Image.NEAREST)
+    regions_img.save(os.path.join(output_dir, "regions.png"))
     print("Saved regions.png")
 
     # --- palette.json ---
@@ -186,6 +280,8 @@ def main() -> None:
     parser.add_argument("--colors", type=int, default=15, help="Number of colors (default: 15)")
     parser.add_argument("--output", default="./output", help="Output directory (default: ./output)")
     parser.add_argument("--blur", type=int, default=4, help="Smoothing radius for edges, 0=off (default: 4)")
+    parser.add_argument("--scale", type=int, default=OUTPUT_SCALE,
+                        help=f"Output resolution multiplier for outline/preview (default: {OUTPUT_SCALE})")
     args = parser.parse_args()
 
     if not os.path.isfile(args.input):
@@ -195,7 +291,7 @@ def main() -> None:
         print("Error: --colors must be between 2 and 30", file=sys.stderr)
         sys.exit(1)
 
-    generate(args.input, args.colors, args.output, blur=args.blur)
+    generate(args.input, args.colors, args.output, blur=args.blur, scale=args.scale)
 
 
 if __name__ == "__main__":
