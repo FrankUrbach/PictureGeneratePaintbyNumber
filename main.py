@@ -46,6 +46,10 @@ def require_admin(x_admin_key: Annotated[Optional[str], Header()] = None) -> Non
 # ---------------------------------------------------------------------------
 
 def _template_to_read(t: Template, base_url: str) -> TemplateRead:
+    try:
+        numberless: list[int] = json.loads(t.numberless_regions)
+    except Exception:
+        numberless = []
     return TemplateRead(
         id=t.id,
         name=t.name,
@@ -54,6 +58,7 @@ def _template_to_read(t: Template, base_url: str) -> TemplateRead:
         outline_url=f"{base_url}/templates/{t.id}/outline",
         preview_url=f"{base_url}/templates/{t.id}/preview",
         palette_url=f"{base_url}/templates/{t.id}/palette",
+        numberless_regions=numberless,
     )
 
 
@@ -63,7 +68,6 @@ def _template_to_read(t: Template, base_url: str) -> TemplateRead:
 
 @app.get("/templates", response_model=list[TemplateRead])
 def list_templates(
-    request_base: str = "",
     session: Session = Depends(get_session),
 ) -> list[TemplateRead]:
     templates = session.exec(select(Template)).all()
@@ -148,37 +152,95 @@ async def upload_template(
     if not (0 <= blur <= 10):
         raise HTTPException(status_code=400, detail="blur must be between 0 and 10")
 
-    # Save upload to a temp file
     suffix = os.path.splitext(file.filename or "upload.jpg")[1] or ".jpg"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
-
-    # Create a placeholder DB entry to get an ID
     name = os.path.splitext(file.filename or "upload")[0]
+
+    # Create placeholder DB entry to get an ID before we know the output dir
     template = Template(
         name=name,
         color_count=colors,
+        blur=blur,
         outline_path="",
         preview_path="",
         palette_path="",
+        original_path="",
+        numberless_regions="[]",
     )
     session.add(template)
     session.commit()
     session.refresh(template)
 
     output_dir = os.path.join(STORAGE_DIR, str(template.id))
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Persist the original image alongside the processed outputs so we can
+    # re-run generate() later without requiring a new upload.
+    original_path = os.path.join(output_dir, f"original{suffix}")
+    with open(original_path, "wb") as f_out:
+        shutil.copyfileobj(file.file, f_out)
 
     try:
-        await run_in_threadpool(generate, tmp_path, colors, output_dir, blur)
-    finally:
-        os.unlink(tmp_path)
+        numberless = await run_in_threadpool(generate, original_path, colors, output_dir, blur)
+    except Exception:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        session.delete(template)
+        session.commit()
+        raise
 
     template.outline_path = os.path.join(output_dir, "outline.png")
     template.preview_path = os.path.join(output_dir, "preview.png")
     template.palette_path = os.path.join(output_dir, "palette.json")
+    template.original_path = original_path
+    template.numberless_regions = json.dumps(numberless)
     session.add(template)
     session.commit()
     session.refresh(template)
 
     return _template_to_read(template, "")
+
+
+@app.post("/admin/templates/{template_id}/reprocess", response_model=TemplateRead)
+async def reprocess_template(
+    template_id: int,
+    colors: Optional[int] = None,
+    blur: Optional[int] = None,
+    _: None = Depends(require_admin),
+    session: Session = Depends(get_session),
+) -> TemplateRead:
+    """Re-run image processing on a stored original without re-uploading.
+
+    Optionally override `colors` and/or `blur`; omit to keep the original values.
+    Returns 409 if the original image was not preserved (templates uploaded before
+    this feature was added must be deleted and re-uploaded once).
+    """
+    t = session.get(Template, template_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Template not found")
+    if not t.original_path or not os.path.isfile(t.original_path):
+        raise HTTPException(
+            status_code=409,
+            detail="Original image not available – delete and re-upload this template once to enable reprocessing",
+        )
+
+    use_colors = colors if colors is not None else t.color_count
+    use_blur = blur if blur is not None else t.blur
+
+    if not (2 <= use_colors <= 64):
+        raise HTTPException(status_code=400, detail="colors must be between 2 and 64")
+    if not (0 <= use_blur <= 10):
+        raise HTTPException(status_code=400, detail="blur must be between 0 and 10")
+
+    output_dir = os.path.dirname(t.outline_path)
+    numberless = await run_in_threadpool(generate, t.original_path, use_colors, output_dir, use_blur)
+
+    t.color_count = use_colors
+    t.blur = use_blur
+    t.numberless_regions = json.dumps(numberless)
+    t.outline_path = os.path.join(output_dir, "outline.png")
+    t.preview_path = os.path.join(output_dir, "preview.png")
+    t.palette_path = os.path.join(output_dir, "palette.json")
+    session.add(t)
+    session.commit()
+    session.refresh(t)
+
+    return _template_to_read(t, "")

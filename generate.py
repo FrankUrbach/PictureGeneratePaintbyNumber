@@ -107,21 +107,23 @@ def build_outline_aa(label_img: np.ndarray, scale: int) -> tuple[np.ndarray, np.
 
 def compute_number_placements(
     label_img: np.ndarray, n_colors: int, scale: int
-) -> dict[int, list[tuple[int, int, float]]]:
+) -> tuple[dict[int, list[tuple[int, int, float]]], set[int]]:
     """
-    Return color_idx -> [(sx, sy, max_r_scaled), ...] at scaled pixel coordinates.
+    Return (placements, numberless_idxs).
 
-    Placement uses the distance transform: each number is placed at the point
-    that is furthest from any region border (deepest interior point). The
-    distance value (max_r) directly determines the maximum font size that fits.
+    placements: color_idx -> [(sx, sy, max_r_scaled), ...] at scaled coordinates.
+    numberless_idxs: color indices where at least one connected component was too
+    thin to receive a number (max inscribed radius < MIN_RADIUS).
 
-    Large regions (>= REPEAT_AREA_THRESHOLD) get a grid of placements; each
-    cell uses its own local distance-transform maximum so every number sits
-    in the most open spot within that cell.
+    Placement uses the distance transform: each number sits at the deepest interior
+    point of a region. Large regions (>= REPEAT_AREA_THRESHOLD) get a grid so
+    every sub-area has its own number.
     """
     MIN_RADIUS = 4  # original pixels; thinner regions get no number
 
     placements: dict[int, list[tuple[int, int, float]]] = {}
+    numberless_idxs: set[int] = set()
+
     for color_idx in range(n_colors):
         mask = (label_img == color_idx).astype(np.uint8)
         dist_full = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
@@ -138,12 +140,10 @@ def compute_number_placements(
             bw = stats[comp_id, cv2.CC_STAT_WIDTH]
             bh = stats[comp_id, cv2.CC_STAT_HEIGHT]
 
-            # Distance transform restricted to this connected component
             comp_mask = (components == comp_id).astype(np.uint8)
             dist = dist_full * comp_mask
 
             if area >= REPEAT_AREA_THRESHOLD:
-                # Split bounding box into a grid; find the best spot per cell.
                 grid_cols = max(2, bw // 150)
                 grid_rows = max(2, bh // 150)
                 step_x = bw // grid_cols
@@ -164,29 +164,30 @@ def compute_number_placements(
                         pts.append((lx * scale, ly * scale, local_max * scale))
                         placed = True
                 if not placed:
-                    # Entire component was too thin – try global max as fallback
                     _, max_r, _, max_loc = cv2.minMaxLoc(dist)
                     if max_r >= MIN_RADIUS:
                         pts.append((max_loc[0] * scale, max_loc[1] * scale, float(max_r) * scale))
+                    else:
+                        numberless_idxs.add(color_idx)
             else:
-                # Single placement at the deepest interior point
                 _, max_r, _, max_loc = cv2.minMaxLoc(dist)
                 if max_r < MIN_RADIUS:
-                    continue  # region too thin for any legible number
+                    numberless_idxs.add(color_idx)
+                    continue
                 pts.append((max_loc[0] * scale, max_loc[1] * scale, float(max_r) * scale))
 
         placements[color_idx] = pts
-    return placements
+    return placements, numberless_idxs
 
 
 def font_size_for_radius(max_r_scaled: float, scale: int) -> int:
     """
     Derive font size from the inscribed-circle radius at scaled resolution.
-    The number height is set to ~80 % of the available diameter, clamped to
-    a sensible range so numbers are always legible but never overflow the region.
+    The number height is set to 75 % of the available diameter, clamped so
+    numbers are always legible (min) but don't overflow narrow regions (max).
     """
     size = int(max_r_scaled * 2 * 0.75)
-    return max(7 * scale, min(18 * scale, size))
+    return max(12 * scale, min(40 * scale, size))
 
 
 def draw_numbers(
@@ -195,6 +196,7 @@ def draw_numbers(
     color_numbers: dict[int, int],
     scale: int,
 ) -> Image.Image:
+    img_w, img_h = outline_img.size
     draw = ImageDraw.Draw(outline_img)
     for color_idx, regions in placements.items():
         number = color_numbers[color_idx]
@@ -208,11 +210,14 @@ def draw_numbers(
             bbox = draw.textbbox((0, 0), text, font=font)
             tw = bbox[2] - bbox[0]
             th = bbox[3] - bbox[1]
-            draw.text((sx - tw // 2, sy - th // 2), text, fill=0, font=font)
+            # Center on placement point, then clamp so the full text stays inside
+            tx = max(0, min(sx - tw // 2, img_w - tw))
+            ty = max(0, min(sy - th // 2, img_h - th))
+            draw.text((tx, ty), text, fill=0, font=font)
     return outline_img
 
 
-def generate(input_path: str, n_colors: int, output_dir: str, blur: int = 4, scale: int = OUTPUT_SCALE) -> None:
+def generate(input_path: str, n_colors: int, output_dir: str, blur: int = 4, scale: int = OUTPUT_SCALE) -> list[int]:
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"Loading image: {input_path}")
@@ -250,7 +255,7 @@ def generate(input_path: str, n_colors: int, output_dir: str, blur: int = 4, sca
         outline_arr[:, :, c] *= (1.0 - alpha)
     outline_img = Image.fromarray(np.clip(outline_arr, 0, 255).astype(np.uint8))
 
-    placements = compute_number_placements(label_img, palette.shape[0], scale)
+    placements, numberless_idxs = compute_number_placements(label_img, palette.shape[0], scale)
     outline_img = draw_numbers(outline_img, placements, color_numbers, scale)
     outline_img.save(os.path.join(output_dir, "outline.png"))
     print("Saved outline.png")
@@ -271,7 +276,12 @@ def generate(input_path: str, n_colors: int, output_dir: str, blur: int = 4, sca
     with open(os.path.join(output_dir, "palette.json"), "w") as f:
         json.dump(palette_data, f, indent=2)
     print("Saved palette.json")
+
+    numberless = sorted(color_numbers[i] for i in numberless_idxs)
+    if numberless:
+        print(f"Regions without number (too thin): color numbers {numberless}")
     print("Done.")
+    return numberless
 
 
 def main() -> None:
@@ -291,7 +301,9 @@ def main() -> None:
         print("Error: --colors must be between 2 and 30", file=sys.stderr)
         sys.exit(1)
 
-    generate(args.input, args.colors, args.output, blur=args.blur, scale=args.scale)
+    numberless = generate(args.input, args.colors, args.output, blur=args.blur, scale=args.scale)
+    if numberless:
+        print(f"Note: color numbers {numberless} have regions too thin to print a number.")
 
 
 if __name__ == "__main__":
