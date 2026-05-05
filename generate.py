@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -69,6 +70,8 @@ def remove_small_regions(label_img: np.ndarray, palette: np.ndarray, min_pixels:
 
 def smooth_labels(label_img: np.ndarray, radius: int) -> np.ndarray:
     """Smooth region boundaries via median filter on the label image."""
+    if radius <= 0:
+        return label_img
     ksize = radius * 2 + 1  # must be odd
     # cv2.medianBlur requires uint8; labels fit easily within that range (<256 colors)
     return cv2.medianBlur(label_img.astype(np.uint8), ksize).astype(np.int32)
@@ -87,11 +90,12 @@ def build_outline_aa(label_img: np.ndarray, scale: int) -> tuple[np.ndarray, np.
     scaled = cv2.resize(label_img.astype(np.uint8), (sw, sh),
                         interpolation=cv2.INTER_NEAREST).astype(np.int32)
 
-    # Detect 1px borders where adjacent labels differ
+    # Detect 1px borders where adjacent labels differ (no wraparound)
     border = np.zeros((sh, sw), dtype=np.uint8)
-    for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-        shifted = np.roll(scaled, (dy, dx), axis=(0, 1))
-        border |= (scaled != shifted).astype(np.uint8)
+    border[1:, :] |= (scaled[1:, :] != scaled[:-1, :]).astype(np.uint8)
+    border[:-1, :] |= (scaled[:-1, :] != scaled[1:, :]).astype(np.uint8)
+    border[:, 1:] |= (scaled[:, 1:] != scaled[:, :-1]).astype(np.uint8)
+    border[:, :-1] |= (scaled[:, :-1] != scaled[:, 1:]).astype(np.uint8)
 
     # Anti-alias: gentle Gaussian blur softens the hard pixel edges
     border_float = border.astype(np.float32) * 255.0
@@ -190,6 +194,26 @@ def font_size_for_radius(max_r_scaled: float, scale: int) -> int:
     return max(12 * scale, min(40 * scale, size))
 
 
+@lru_cache(maxsize=64)
+def _load_number_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/local/share/fonts/DejaVuSans-Bold.ttf",
+        "/usr/local/share/fonts/DejaVuSans.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ]
+    for path in font_paths:
+        if os.path.isfile(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
 def draw_numbers(
     outline_img: Image.Image,
     placements: dict[int, list[tuple[int, int, float]]],
@@ -202,10 +226,7 @@ def draw_numbers(
         number = color_numbers[color_idx]
         for sx, sy, max_r_scaled in regions:
             size = font_size_for_radius(max_r_scaled, scale)
-            try:
-                font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", size)
-            except Exception:
-                font = ImageFont.load_default()
+            font = _load_number_font(size)
             text = str(number)
             bbox = draw.textbbox((0, 0), text, font=font)
             tw = bbox[2] - bbox[0]
@@ -298,7 +319,7 @@ def main() -> None:
         print(f"Error: file not found: {args.input}", file=sys.stderr)
         sys.exit(1)
     if not (2 <= args.colors <= 64):
-        print("Error: --colors must be between 2 and 30", file=sys.stderr)
+        print("Error: --colors must be between 2 and 64", file=sys.stderr)
         sys.exit(1)
 
     numberless = generate(args.input, args.colors, args.output, blur=args.blur, scale=args.scale)
